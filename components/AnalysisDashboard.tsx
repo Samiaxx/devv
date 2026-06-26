@@ -6,6 +6,7 @@ import { ContractList } from "./ContractList";
 import { ENSCard } from "./ENSCard";
 import { MintButton } from "./MintButton";
 import { AttestButton } from "./AttestButton";
+import { EndorseButton } from "./EndorseButton";
 import { NoticeBox } from "@/components/ui/NoticeBox";
 
 interface AnalysisDashboardProps {
@@ -72,8 +73,9 @@ export function AnalysisDashboard({ analysis, network }: AnalysisDashboardProps)
       </div>
 
       {/* ── Actions ─────────────────────────────────────────────────────────── */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-fade-in-up">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 animate-fade-in-up">
         <AttestButton profile={profile} address={analysis.address} />
+        <EndorseButton profile={profile} address={analysis.address} />
         <MintButton
           profile={profile}
           address={analysis.address}

@@ -11,6 +11,9 @@
  *   5. User rejection       → user denied in wallet
  *   6. Contract/RPC failure  → revert, network error, or other failure
  *
+ * Calls the `endorse(address, score)` function on the ProofOfDev contract,
+ * which records that the connected wallet vouches for the endorsed address.
+ *
  * Uses wagmi v2 hooks for state management.
  * Error classification distinguishes user rejection from technical failures.
  */
@@ -23,7 +26,7 @@ import {
   useChainId,
   useSwitchChain,
   useConnect,
-  useDisconnect,
+  useReadContract,
 } from "wagmi";
 import { sepolia } from "wagmi/chains";
 import { ReputationProfile, EndorsementState, EndorsementStatus } from "@/lib/types";
@@ -74,7 +77,9 @@ function classifyError(err: unknown): {
   if (
     lower.includes("execution reverted") ||
     lower.includes("revert") ||
-    lower.includes("require(")
+    lower.includes("require(") ||
+    lower.includes("already endorsed") ||
+    lower.includes("cannot self-endorse")
   ) {
     return {
       message: "The contract rejected the transaction. This may be a configuration issue.",
@@ -122,7 +127,6 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
   const chainId = useChainId();
   const { switchChain } = useSwitchChain();
   const { connect, connectors } = useConnect();
-  const { disconnect } = useDisconnect();
 
   const [endorseState, setEndorseState] = useState<EndorsementState>({
     status: "idle",
@@ -135,6 +139,17 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
   const isOnSepolia = chainId === sepolia.id;
   const isContractConfigured =
     CONTRACT_ADDRESS !== "0x0000000000000000000000000000000000000000";
+
+  // Check if current user has already endorsed this address
+  const { data: alreadyEndorsed } = useReadContract({
+    address: CONTRACT_ADDRESS as `0x${string}`,
+    abi: CONTRACT_ABI,
+    functionName: "hasEndorsed",
+    args: connectedAddress && address ? [connectedAddress, address as `0x${string}`] : undefined,
+    query: {
+      enabled: isContractConfigured && !!connectedAddress && !!address && isOnSepolia,
+    },
+  });
 
   // wagmi write hook
   const {
@@ -251,6 +266,17 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
       return;
     }
 
+    if (alreadyEndorsed) {
+      setEndorseState({
+        status: "error",
+        txHash: null,
+        blockNumber: null,
+        error: "You have already endorsed this address.",
+        errorCategory: "contract_error",
+      });
+      return;
+    }
+
     setEndorseState({
       status: "awaitingConfirmation",
       txHash: null,
@@ -262,15 +288,10 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
     writeContract({
       address: CONTRACT_ADDRESS as `0x${string}`,
       abi: CONTRACT_ABI,
-      functionName: "mint",
-      args: [
-        BigInt(profile.score),
-        BigInt(profile.summary.contractCount),
-        BigInt(profile.summary.verifiedContractCount),
-        profile.summary.hasENS,
-      ],
+      functionName: "endorse",
+      args: [address as `0x${string}`, BigInt(profile.score)],
     });
-  }, [isContractConfigured, profile, writeContract]);
+  }, [isContractConfigured, alreadyEndorsed, address, profile.score, writeContract]);
 
   const handleRetry = useCallback(() => {
     setEndorseState((s) => ({
@@ -328,6 +349,26 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           <WalletIcon className="w-4 h-4" />
           Connect Wallet
         </button>
+      </div>
+    );
+  }
+
+  // ── Render: Already Endorsed ───────────────────────────────────────────────
+
+  if (alreadyEndorsed && endorseState.status === "idle") {
+    return (
+      <div className="rounded-2xl border border-green-500/20 bg-green-500/8 p-5 space-y-3 animate-fade-in-up">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-green-500/15 flex items-center justify-center text-xl flex-shrink-0">
+            ✅
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-green-400">Already Endorsed</p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              You have already endorsed this developer&apos;s profile on-chain.
+            </p>
+          </div>
+        </div>
       </div>
     );
   }
@@ -570,7 +611,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
       ) : (
         <button
           onClick={handleEndorse}
-          disabled={isBusy}
+          disabled={isBusy || !!alreadyEndorsed}
           className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 disabled:cursor-not-allowed text-white font-semibold rounded-xl transition-colors text-sm flex items-center justify-center gap-2"
         >
           {isBusy ? (

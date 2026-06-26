@@ -71,6 +71,34 @@ export const CONTRACT_ABI = [
     stateMutability: "nonpayable",
     type: "function",
   },
+  {
+    inputs: [
+      { internalType: "address", name: "endorsed", type: "address" },
+      { internalType: "uint256", name: "score", type: "uint256" },
+    ],
+    name: "endorse",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+  // Read endorsements
+  {
+    inputs: [
+      { internalType: "address", name: "endorser", type: "address" },
+      { internalType: "address", name: "endorsed", type: "address" },
+    ],
+    name: "hasEndorsed",
+    outputs: [{ internalType: "bool", name: "", type: "bool" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [{ internalType: "address", name: "", type: "address" }],
+    name: "endorsementCount",
+    outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
   // Events
   {
     anonymous: false,
@@ -90,6 +118,16 @@ export const CONTRACT_ABI = [
       },
     ],
     name: "Minted",
+    type: "event",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: "address", name: "endorser", type: "address" },
+      { indexed: true, internalType: "address", name: "endorsed", type: "address" },
+      { indexed: false, internalType: "uint256", name: "score", type: "uint256" },
+    ],
+    name: "Endorsed",
     type: "event",
   },
 ] as const;

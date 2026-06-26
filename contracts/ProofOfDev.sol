@@ -14,6 +14,7 @@ contract ProofOfDev {
 
     event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
     event Minted(address indexed to, uint256 indexed tokenId, uint256 score);
+    event Endorsed(address indexed endorser, address indexed endorsed, uint256 score);
 
     // ─── Storage ───────────────────────────────────────────────────────────────
 
@@ -41,6 +42,12 @@ contract ProofOfDev {
 
     // Base URI for token metadata (points to our API)
     string private _baseTokenURI;
+
+    // endorser address → endorsed address → bool
+    mapping(address => mapping(address => bool)) public endorsements;
+
+    // endorsed address → number of endorsements received
+    mapping(address => uint256) public endorsementCount;
 
     address public owner;
 
@@ -155,6 +162,35 @@ contract ProofOfDev {
 
     function totalSupply() external view returns (uint256) {
         return _nextTokenId - 1;
+    }
+
+    // ─── Endorsements ──────────────────────────────────────────────────────────
+
+    /**
+     * @notice Endorse another developer's on-chain activity.
+     * @dev Records that msg.sender vouches for the endorsed address.
+     *      Each endorser can only endorse a given address once.
+     *      Self-endorsement is not allowed (use mint instead).
+     *
+     * @param endorsed  The address being endorsed.
+     * @param score     The reputation score of the endorsed address at time of endorsement.
+     */
+    function endorse(address endorsed, uint256 score) external {
+        require(endorsed != address(0), "Zero address");
+        require(endorsed != msg.sender, "Cannot self-endorse");
+        require(!endorsements[msg.sender][endorsed], "Already endorsed");
+
+        endorsements[msg.sender][endorsed] = true;
+        endorsementCount[endorsed]++;
+
+        emit Endorsed(msg.sender, endorsed, score);
+    }
+
+    /**
+     * @notice Check if endorser has endorsed a given address.
+     */
+    function hasEndorsed(address endorser, address endorsed) external view returns (bool) {
+        return endorsements[endorser][endorsed];
     }
 
     // ─── Admin ─────────────────────────────────────────────────────────────────
