@@ -63,7 +63,7 @@ Run with: `npm test`
 
 ### Task 2: Web3 Transaction-State Experience
 
-**Changes:** `components/EndorseButton.tsx`, `lib/types.ts`, `contracts/ProofOfDev.sol`, `lib/contract.ts`
+**Changes:** `components/EndorseButton.tsx`, `components/AttestButton.tsx`, `lib/types.ts`, `contracts/ProofOfDev.sol`, `lib/contract.ts`, `hardhat.config.cjs`, `scripts/deploy.ts`, `.env.example`
 
 #### Smart Contract: `endorse()` Function
 
@@ -86,6 +86,12 @@ Supporting state: `endorsements` (mapping: endorser → endorsed → bool), `end
 
 The ABI in `lib/contract.ts` includes all four new entries: `endorse`, `hasEndorsed`, `endorsementCount`, and `Endorsed` event.
 
+#### Deployment Setup
+
+- **`hardhat.config.cjs`** — Hardhat configuration for Sepolia deployment (CommonJS format for ESM project compatibility)
+- **`scripts/deploy.ts`** — Rewritten for Hardhat native deployment (`npx hardhat run scripts/deploy.ts --network sepolia`)
+- **`.env.example`** — Updated with `DEPLOYER_PRIVATE_KEY`, `NEXT_PUBLIC_ALCHEMY_API_KEY`, and demo mode variables
+
 #### EndorseButton Component
 
 Implements a user-facing endorsement flow with 6 explicit transaction states:
@@ -99,32 +105,71 @@ Implements a user-facing endorsement flow with 6 explicit transaction states:
 | **rejected** | Yellow warning, "no funds charged" message, "Try Again" button | Retry immediately |
 | **error** | Red error card, classified error message, context-specific help, Retry | Depends on error category |
 
+#### AttestButton Component
+
+Implements a user-facing EAS delegated attestation flow with the same 6 transaction states:
+
+| State | UI | Recovery |
+|---|---|---|
+| **notConnected** | Wallet icon, feature summary, "Connect Wallet" button | Connect via injected provider |
+| **awaitingConfirmation** | Spinner + "Server is signing attestation" message | Wait or reject in wallet |
+| **submitted** | Spinner + tx hash, "Waiting for blockchain confirmation" | Wait for block confirmation |
+| **confirmed** | Green success card, attestation UID, tx hash, EAS Explorer link | — |
+| **rejected** | Yellow warning, "no funds charged" message, "Try Again" button | Retry immediately |
+| **error** | Red error card, classified error message (server/rpc/network), Retry | Depends on error category |
+
+The attestation flow is: (1) Browser sends profile to server via `POST /api/attest`, (2) Server signs delegated attestation with `ATTESTER_PRIVATE_KEY`, (3) Browser submits signed payload to EAS contract on Sepolia (user pays gas), (4) Attestation is permanently on-chain.
+
 #### Error Classification
 
-The `classifyError()` function parses error messages into 4 categories:
+Both buttons use `classifyError()` to parse errors into user-facing categories:
 
+**EndorseButton categories:**
 - **`user_rejected`** — EIP-1193 code 4001 / "user denied" / "action_rejected" → Shows "Try Again" (no penalty)
 - **`rpc_failure`** — "insufficient funds" / network timeout → Suggests network check or Sepolia switch
 - **`contract_error`** — "execution reverted" / contract not deployed → Suggests contacting maintainer
 - **`network_error`** — fetch failures, 502/503/504 → Suggests connection check
 
+**AttestButton categories:**
+- **`user_rejected`** — Same as above
+- **`rpc_failure`** — "insufficient funds" → Suggests Sepolia ETH
+- **`server_error`** — "ATTESTER_PRIVATE_KEY not set" / "schema UID not configured" / 500 errors → Suggests contacting maintainer
+- **`network_error`** — Same as above
+
 Each category renders a different help message and recovery action, rather than a generic "something went wrong" error.
+
+#### Demo Mode
+
+Both buttons support a demo mode that simulates all 6 states without hitting the blockchain. This allows reviewers to test the full UI flow without deploying contracts or spending testnet ETH.
+
+**Activation:** Set `NEXT_PUBLIC_DEMO_MODE=true` in `.env.local`. The EndorseButton also auto-detects demo mode when `CONTRACT_ADDRESS` is the zero address (contract not deployed).
+
+**Demo scenarios** via `NEXT_PUBLIC_DEMO_SCENARIO`:
+- `success` — Always shows the happy path (State 2 → 3 → 4)
+- `reject` — Always shows user rejection (State 2 → 5)
+- `error` — Always shows contract/server error (State 2 → 3 → 6)
+- `cycle` — Alternates through success → reject → error on each click
+
+In cycle mode, each terminal state (confirmed, rejected, error) shows a "🎭 Try Next Scenario →" button that automatically advances to the next scenario with a 300ms transition delay.
+
+Each state displays an amber "🎭 Demo Mode" banner indicating which state (e.g., "State 4/6: Confirmed") and which scenario is active.
 
 #### State Management
 
-Uses wagmi v2 hooks (`useWriteContract`, `useWaitForTransactionReceipt`) with `useEffect` hooks that synchronize wagmi's async state with the explicit `EndorsementState` machine. This ensures:
+Both buttons use wagmi v2 hooks with `useEffect` hooks that synchronize wagmi's async state with explicit state machines. This ensures:
 - No state can be skipped (e.g., can't jump from idle to confirmed)
 - Error states always include a category for programmatic handling
 - The component recovers cleanly from any error via `resetWrite()`
 
-The `hasEndorsed()` read contract hook pre-checks repeat visitors so they see "Already Endorsed" without a wasted gas attempt.
+EndorseButton's `hasEndorsed()` read contract hook pre-checks repeat visitors so they see "Already Endorsed" without a wasted gas attempt.
 
-#### Types Added
+#### Types Updated
 
 ```typescript
+// Endorsement (unchanged)
 type EndorsementStatus =
-  "notConnected" | "idle" | "awaitingConfirmation" |
-  "submitted" | "confirmed" | "rejected" | "error";
+  | "notConnected" | "idle" | "awaitingConfirmation"
+  | "submitted" | "confirmed" | "rejected" | "error";
 
 interface EndorsementState {
   status: EndorsementStatus;
@@ -134,6 +179,21 @@ interface EndorsementState {
   errorCategory:
     | "user_rejected" | "rpc_failure"
     | "contract_error" | "network_error" | null;
+}
+
+// Attestation (expanded from 5 to 9 statuses + errorCategory)
+interface AttestationState {
+  status:
+    | "notConnected" | "idle" | "signing"
+    | "awaitingConfirmation" | "pending"
+    | "submitted" | "confirmed"
+    | "rejected" | "error";
+  uid: string | null;
+  txHash: string | null;
+  error: string | null;
+  errorCategory:
+    | "user_rejected" | "rpc_failure"
+    | "server_error" | "network_error" | null;
 }
 ```
 
@@ -288,7 +348,7 @@ function _update(address to, uint256 tokenId, address auth)
 
 **Wallet connection** — Uses RainbowKit with wagmi, which handles WalletConnect and injected providers. RainbowKit shows a clear connection dialog and supports hardware wallets (explicit `HardwareWalletNotice` component). No custom wallet connection code that could leak keys.
 
-**Transaction safety** — `EndorseButton` shows the exact action before signing: the user sees "Endorse Developer" with the target address and score before confirming. The contract ABI is hardcoded (not fetched from an external source), preventing ABI manipulation attacks.
+**Transaction safety** — Both `EndorseButton` and `AttestButton` show the exact action before signing: the user sees the target address and score before confirming. The contract ABI is hardcoded (not fetched from an external source), preventing ABI manipulation attacks.
 
 **Input sanitization in scoring** — `computeReputationScore()` accepts `unknown` inputs and sanitizes everything internally. This means even if the API returns malformed data, the scoring engine won't crash or produce NaN scores. The 50-test suite verifies this exhaustively.
 
@@ -365,5 +425,42 @@ npx tsc --noEmit
 # Dev server (starts Next.js + API + Worker)
 npm run dev
 ```
+
+#### Demo Mode Testing
+
+To test the EndorseButton and AttestButton without deploying contracts or spending testnet ETH:
+
+1. Copy `.env.example` to `.env.local` and set:
+   ```
+   NEXT_PUBLIC_DEMO_MODE=true
+   NEXT_PUBLIC_DEMO_SCENARIO=cycle
+   ```
+2. Run `npm run dev` and connect any wallet
+3. Click "Endorse (Demo)" or "Get Attestation (Demo)" to cycle through all 6 states:
+   - Click 1 → Confirmed (success path)
+   - Click 2 → Rejected (user denial)
+   - Click 3 → Error (contract/server failure)
+   - Click 4+ → Repeats the cycle
+
+Each state shows an amber "🎭 Demo Mode" banner indicating the current state number.
+
+#### Contract Deployment (Optional)
+
+To test with real on-chain transactions:
+
+1. Get Sepolia ETH from https://sepoliafaucet.com
+2. Add to `.env.local`:
+   ```
+   DEPLOYER_PRIVATE_KEY=0x...
+   NEXT_PUBLIC_ALCHEMY_API_KEY=...
+   ```
+3. Deploy:
+   ```bash
+   npx hardhat run scripts/deploy.ts --network sepolia --config hardhat.config.cjs
+   ```
+4. Add the deployed address to `.env.local`:
+   ```
+   NEXT_PUBLIC_CONTRACT_ADDRESS=0x...
+   ```
 
 No private keys, API credentials, or paid service credentials are included in this PR.
