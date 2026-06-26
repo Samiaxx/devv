@@ -16,9 +16,12 @@
  *
  * Uses wagmi v2 hooks for state management.
  * Error classification distinguishes user rejection from technical failures.
+ *
+ * Demo mode: when NEXT_PUBLIC_DEMO_MODE=true or contract is not deployed,
+ * the button simulates all 6 states without hitting the blockchain.
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   useAccount,
   useWriteContract,
@@ -32,6 +35,26 @@ import { sepolia } from "wagmi/chains";
 import { ReputationProfile, EndorsementState, EndorsementStatus } from "@/lib/types";
 import { CONTRACT_ADDRESS, CONTRACT_ABI } from "@/lib/contract";
 import { Spinner } from "@/components/ui/Spinner";
+
+// ─── Demo mode detection ──────────────────────────────────────────────────────
+
+const IS_DEMO_MODE =
+  process.env.NEXT_PUBLIC_DEMO_MODE === "true" ||
+  CONTRACT_ADDRESS === "0x0000000000000000000000000000000000000000";
+
+// Demo scenario selector — set via NEXT_PUBLIC_DEMO_SCENARIO
+// Options: "success", "reject", "error", "cycle" (cycles through all)
+type DemoScenario = "success" | "reject" | "error" | "cycle";
+
+function getDemoScenario(): DemoScenario {
+  const env = process.env.NEXT_PUBLIC_DEMO_SCENARIO;
+  if (env === "reject" || env === "error" || env === "cycle") return env;
+  return "success";
+}
+
+// Simulated demo transaction hashes
+const DEMO_TX_HASH = "0x" + "a".repeat(64);
+const DEMO_BLOCK_NUMBER = 12345678;
 
 // ─── Error classification ─────────────────────────────────────────────────────
 
@@ -136,6 +159,9 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
     errorCategory: null,
   });
 
+  // Track which demo scenario to show next (for "cycle" mode)
+  const demoCycleRef = useRef(0);
+
   const isOnSepolia = chainId === sepolia.id;
   const isContractConfigured =
     CONTRACT_ADDRESS !== "0x0000000000000000000000000000000000000000";
@@ -147,7 +173,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
     functionName: "hasEndorsed",
     args: connectedAddress && address ? [connectedAddress, address as `0x${string}`] : undefined,
     query: {
-      enabled: isContractConfigured && !!connectedAddress && !!address && isOnSepolia,
+      enabled: !IS_DEMO_MODE && isContractConfigured && !!connectedAddress && !!address && isOnSepolia,
     },
   });
 
@@ -170,7 +196,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
     query: { enabled: !!txHash },
   });
 
-  // ── State transitions based on wagmi hooks ─────────────────────────────────
+  // ── State transitions based on wagmi hooks (live mode only) ────────────────
 
   // Sync wallet connection status
   useEffect(() => {
@@ -252,9 +278,95 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
     }
   }, [receiptError]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Handlers ───────────────────────────────────────────────────────────────
+  // ── Demo mode handlers ────────────────────────────────────────────────────
+
+  const runDemoScenario = useCallback(
+    (scenario: "success" | "reject" | "error") => {
+      // Step 1: awaitingConfirmation (after 500ms delay to simulate wallet popup)
+      setEndorseState({
+        status: "awaitingConfirmation",
+        txHash: null,
+        blockNumber: null,
+        error: null,
+        errorCategory: null,
+      });
+
+      if (scenario === "reject") {
+        // After 1.5s, simulate user rejection
+        setTimeout(() => {
+          setEndorseState({
+            status: "rejected",
+            txHash: null,
+            blockNumber: null,
+            error: "You rejected the transaction in your wallet.",
+            errorCategory: "user_rejected",
+          });
+        }, 1500);
+        return;
+      }
+
+      // Step 2: submitted (after 1.5s)
+      setTimeout(() => {
+        setEndorseState({
+          status: "submitted",
+          txHash: DEMO_TX_HASH,
+          blockNumber: null,
+          error: null,
+          errorCategory: null,
+        });
+
+        if (scenario === "error") {
+          // After 2 more seconds, simulate contract error
+          setTimeout(() => {
+            setEndorseState({
+              status: "error",
+              txHash: DEMO_TX_HASH,
+              blockNumber: null,
+              error: "Execution reverted: Already endorsed this address.",
+              errorCategory: "contract_error",
+            });
+          }, 2000);
+          return;
+        }
+
+        // Step 3: confirmed (after 2 more seconds)
+        setTimeout(() => {
+          setEndorseState({
+            status: "confirmed",
+            txHash: DEMO_TX_HASH,
+            blockNumber: DEMO_BLOCK_NUMBER,
+            error: null,
+            errorCategory: null,
+          });
+        }, 2000);
+      }, 1500);
+    },
+    []
+  );
+
+  const handleDemoEndorse = useCallback(() => {
+    const scenario = getDemoScenario();
+    if (scenario === "cycle") {
+      const scenarios: Array<"success" | "reject" | "error"> = [
+        "success",
+        "reject",
+        "error",
+      ];
+      runDemoScenario(scenarios[demoCycleRef.current % 3]);
+      demoCycleRef.current++;
+    } else {
+      runDemoScenario(scenario);
+    }
+  }, [runDemoScenario]);
+
+  // ── Handlers ──────────────────────────────────────────────────────────────
 
   const handleEndorse = useCallback(() => {
+    if (IS_DEMO_MODE) {
+      handleDemoEndorse();
+      return;
+    }
+
     if (!isContractConfigured) {
       setEndorseState({
         status: "error",
@@ -291,7 +403,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
       functionName: "endorse",
       args: [address as `0x${string}`, BigInt(profile.score)],
     });
-  }, [isContractConfigured, alreadyEndorsed, address, profile.score, writeContract]);
+  }, [isContractConfigured, alreadyEndorsed, address, profile.score, writeContract, handleDemoEndorse]);
 
   const handleRetry = useCallback(() => {
     setEndorseState((s) => ({
@@ -315,6 +427,11 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
   if (endorseState.status === "notConnected" || !isConnected) {
     return (
       <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 space-y-4 animate-fade-in-up">
+        {IS_DEMO_MODE && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — Connect any wallet to preview all states
+          </div>
+        )}
         <div className="flex items-start gap-3">
           <div className="w-10 h-10 rounded-xl bg-slate-800 flex items-center justify-center flex-shrink-0">
             <WalletIcon />
@@ -353,9 +470,9 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
     );
   }
 
-  // ── Render: Already Endorsed ───────────────────────────────────────────────
+  // ── Render: Already Endorsed (live mode only) ─────────────────────────────
 
-  if (alreadyEndorsed && endorseState.status === "idle") {
+  if (!IS_DEMO_MODE && alreadyEndorsed && endorseState.status === "idle") {
     return (
       <div className="rounded-2xl border border-green-500/20 bg-green-500/8 p-5 space-y-3 animate-fade-in-up">
         <div className="flex items-center gap-3">
@@ -378,6 +495,11 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
   if (endorseState.status === "confirmed") {
     return (
       <div className="rounded-2xl border border-green-500/20 bg-green-500/8 p-5 space-y-3 animate-fade-in-up">
+        {IS_DEMO_MODE && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — State 4/6: Confirmed
+          </div>
+        )}
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl bg-green-500/15 flex items-center justify-center text-xl flex-shrink-0">
             ✅
@@ -385,7 +507,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           <div>
             <p className="text-sm font-semibold text-green-400">Endorsement Confirmed</p>
             <p className="text-xs text-slate-400 mt-0.5">
-              Your endorsement has been recorded on the Sepolia blockchain.
+              Your endorsement has been recorded on the {IS_DEMO_MODE ? "simulated " : ""}Sepolia blockchain.
             </p>
           </div>
         </div>
@@ -394,20 +516,29 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           {endorseState.txHash && (
             <div className="flex items-start gap-2">
               <span className="text-slate-600 flex-shrink-0">Tx</span>
-              <a
-                href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-indigo-400 hover:underline break-all"
-              >
-                {endorseState.txHash.slice(0, 20)}... ↗
-              </a>
+              <span className="text-indigo-400 break-all">
+                {endorseState.txHash.slice(0, 20)}...
+                {!IS_DEMO_MODE && (
+                  <a
+                    href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="ml-1 hover:underline"
+                  >
+                    ↗
+                  </a>
+                )}
+                {IS_DEMO_MODE && <span className="ml-1 text-amber-400">(simulated)</span>}
+              </span>
             </div>
           )}
           {endorseState.blockNumber && (
             <div className="flex items-start gap-2">
               <span className="text-slate-600 flex-shrink-0">Block</span>
-              <span className="text-slate-300">{endorseState.blockNumber}</span>
+              <span className="text-slate-300">
+                {endorseState.blockNumber}
+                {IS_DEMO_MODE && <span className="ml-1 text-amber-400 text-[10px]">(simulated)</span>}
+              </span>
             </div>
           )}
           <div className="flex items-start gap-2">
@@ -420,17 +551,19 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           </div>
         </div>
 
-        <a
-          href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center justify-center gap-2 w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors border border-slate-700"
-        >
-          View on Etherscan ↗
-        </a>
+        {!IS_DEMO_MODE && (
+          <a
+            href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center gap-2 w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors border border-slate-700"
+          >
+            View on Etherscan ↗
+          </a>
+        )}
 
         <p className="text-xs text-slate-600 text-center">
-          Endorsed on Proof of Dev · Sepolia testnet
+          {IS_DEMO_MODE ? "Demo" : "Endorsed on Proof of Dev"} · Sepolia testnet
         </p>
       </div>
     );
@@ -441,6 +574,11 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
   if (endorseState.status === "rejected") {
     return (
       <div className="rounded-2xl border border-yellow-500/20 bg-yellow-500/8 p-5 space-y-4 animate-fade-in-up">
+        {IS_DEMO_MODE && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — State 5/6: User Rejection
+          </div>
+        )}
         <div className="flex items-start gap-3">
           <div className="w-10 h-10 rounded-xl bg-yellow-500/15 flex items-center justify-center text-xl flex-shrink-0">
             🚫
@@ -472,6 +610,11 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
   if (endorseState.status === "error") {
     return (
       <div className="rounded-2xl border border-red-500/20 bg-red-500/8 p-5 space-y-4 animate-fade-in-up">
+        {IS_DEMO_MODE && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — State 6/6: Error
+          </div>
+        )}
         <div className="flex items-start gap-3">
           <div className="w-10 h-10 rounded-xl bg-red-500/15 flex items-center justify-center text-xl flex-shrink-0">
             ⚠️
@@ -503,7 +646,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
         )}
 
         <div className="flex gap-3">
-          {!isOnSepolia && (
+          {!IS_DEMO_MODE && !isOnSepolia && (
             <button
               onClick={() => switchChain({ chainId: sepolia.id })}
               className="flex-1 py-2.5 px-4 bg-yellow-600 hover:bg-yellow-500 text-white font-semibold rounded-xl transition-colors text-sm"
@@ -519,7 +662,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           </button>
         </div>
 
-        {endorseState.txHash && (
+        {endorseState.txHash && !IS_DEMO_MODE && (
           <a
             href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
             target="_blank"
@@ -540,6 +683,16 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
 
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 space-y-4 animate-fade-in-up">
+      {/* Demo mode banner */}
+      {IS_DEMO_MODE && (
+        <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+          🎭 Demo Mode
+          {endorseState.status === "idle" && " — Click Endorse to simulate"}
+          {endorseState.status === "awaitingConfirmation" && " — State 2/6: Awaiting Confirmation"}
+          {endorseState.status === "submitted" && " — State 3/6: Submitted"}
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-start gap-3">
         <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center flex-shrink-0">
@@ -548,7 +701,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
         <div>
           <p className="text-sm font-semibold text-white">Endorse Developer</p>
           <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">
-            Record your endorsement of this developer&apos;s on-chain activity on the Sepolia blockchain.
+            Record your endorsement of this developer&apos;s on-chain activity on the {IS_DEMO_MODE ? "simulated " : ""}Sepolia blockchain.
           </p>
         </div>
       </div>
@@ -560,7 +713,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
         <DataRow label="Contracts" value={String(profile.summary.contractCount)} />
         <DataRow label="Verified" value={String(profile.summary.verifiedContractCount)} />
         <DataRow label="ENS" value={profile.summary.hasENS ? "Yes" : "No"} />
-        <DataRow label="Network" value="Sepolia" />
+        <DataRow label="Network" value={IS_DEMO_MODE ? "Sepolia (demo)" : "Sepolia"} />
       </div>
 
       {/* In-progress feedback */}
@@ -570,7 +723,9 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           <div>
             <p className="text-xs font-medium text-indigo-300">Awaiting wallet confirmation</p>
             <p className="text-xs text-slate-500 mt-0.5">
-              Please confirm the transaction in your wallet.
+              {IS_DEMO_MODE
+                ? "Simulating wallet popup... (auto-advancing in 1.5s)"
+                : "Please confirm the transaction in your wallet."}
             </p>
           </div>
         </div>
@@ -583,25 +738,33 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
             <div>
               <p className="text-xs font-medium text-blue-300">Transaction submitted</p>
               <p className="text-xs text-slate-500 mt-0.5">
-                Waiting for blockchain confirmation...
+                {IS_DEMO_MODE
+                  ? "Simulating block confirmation... (auto-advancing in 2s)"
+                  : "Waiting for blockchain confirmation..."}
               </p>
             </div>
           </div>
           {endorseState.txHash && (
-            <a
-              href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="block text-xs text-indigo-400 hover:underline font-mono"
-            >
-              {endorseState.txHash.slice(0, 24)}... ↗
-            </a>
+            <span className="block text-xs text-indigo-400 font-mono">
+              {endorseState.txHash.slice(0, 24)}...
+              {IS_DEMO_MODE && <span className="ml-1 text-amber-400 text-[10px]">(simulated)</span>}
+              {!IS_DEMO_MODE && (
+                <a
+                  href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="ml-1 hover:underline"
+                >
+                  ↗
+                </a>
+              )}
+            </span>
           )}
         </div>
       )}
 
       {/* Network switch or endorse button */}
-      {!isOnSepolia ? (
+      {!IS_DEMO_MODE && !isOnSepolia ? (
         <button
           onClick={() => switchChain({ chainId: sepolia.id })}
           className="w-full py-2.5 px-4 bg-yellow-600 hover:bg-yellow-500 text-white font-semibold rounded-xl transition-colors text-sm"
@@ -611,7 +774,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
       ) : (
         <button
           onClick={handleEndorse}
-          disabled={isBusy || !!alreadyEndorsed}
+          disabled={isBusy || (!IS_DEMO_MODE && !!alreadyEndorsed)}
           className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 disabled:cursor-not-allowed text-white font-semibold rounded-xl transition-colors text-sm flex items-center justify-center gap-2"
         >
           {isBusy ? (
@@ -624,14 +787,14 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           ) : (
             <>
               <EndorseIcon className="w-4 h-4" />
-              Endorse
+              {IS_DEMO_MODE ? "Endorse (Demo)" : "Endorse"}
             </>
           )}
         </button>
       )}
 
       <p className="text-xs text-slate-700 text-center">
-        Sepolia testnet · Permanent · Public
+        {IS_DEMO_MODE ? "Demo" : "Sepolia testnet"} · Permanent · Public
       </p>
     </div>
   );
