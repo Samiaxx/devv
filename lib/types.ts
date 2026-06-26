@@ -139,3 +139,35 @@ export interface MintState {
   tokenId: string | null;
   error: string | null;
 }
+
+// ─── Endorsement transaction states ────────────────────────────────────────────
+
+/**
+ * Distinct states for an endorsement transaction flow.
+ * Each state maps to a specific UI representation.
+ *
+ * notConnected  — wallet is not connected; prompt user to connect
+ * idle          — wallet connected, ready to endorse
+ * awaitingConfirmation — tx sent to wallet, waiting for user to sign
+ * submitted     — tx submitted to network, waiting for confirmation
+ * confirmed     — tx confirmed on-chain
+ * rejected      — user rejected the tx in their wallet
+ * error         — contract call or RPC failure
+ */
+export type EndorsementStatus =
+  | "notConnected"
+  | "idle"
+  | "awaitingConfirmation"
+  | "submitted"
+  | "confirmed"
+  | "rejected"
+  | "error";
+
+export interface EndorsementState {
+  status: EndorsementStatus;
+  txHash: string | null;
+  blockNumber: number | null;
+  error: string | null;
+  /** Error category for programmatic handling */
+  errorCategory: "user_rejected" | "rpc_failure" | "contract_error" | "network_error" | null;
+}
