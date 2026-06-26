@@ -39,6 +39,7 @@ THEORETICAL_MAX_SCORE = 200
 |---|---|---|
 | Contract deployment | +5 per (cap 10) | Base activity signal; capped to prevent spam |
 | Verified contract | +10 per (cap 10) | Verification requires effort (source code + constructor args); stronger signal |
+| Endorsement received | +3 per (cap 10) | Social signal from other developers; lower weight than code verification |
 | ENS ownership | +2 (flat) | Identity signal; low weight because ENS is cheap and not developer-specific |
 | ENS metadata | +3 per field | Shows active ENS usage; 3 fields (avatar, url, github) = max +9 |
 | Time (established) | 1.2x multiplier | Rewards sustained activity over time |
@@ -47,7 +48,7 @@ THEORETICAL_MAX_SCORE = 200
 
 #### Tests
 
-50 unit tests covering:
+117 unit tests covering:
 - `sanitizeNumber`: NaN, Infinity, negative, overflow, non-numeric types, decimals, clamping
 - `sanitizeContracts`: null/undefined, missing fields, NaN timestamps, empty array
 - `sanitizeENS`: null/undefined, empty strings, partial objects, valid data
@@ -55,7 +56,7 @@ THEORETICAL_MAX_SCORE = 200
 - `getTimeMultiplier`: established vs recent, unknown timestamp, invalid input
 - `detectBurstContracts`: below threshold, within window, spread over time, empty
 - `getScoreTier`: all tier boundaries, clamping, NaN/overflow
-- `computeReputationScore` (integration): empty input, null input, determinism, score range, verified vs unverified, ENS vs no-ENS, cap behavior, invalid entries, NaN timestamps
+- `computeReputationScore` (integration): empty input, null input, determinism, score range, verified vs unverified, ENS vs no-ENS, cap behavior, invalid entries, NaN timestamps, endorsement scoring, endorsement cap, invalid endorsement count
 
 Run with: `npm test`
 
@@ -179,6 +180,26 @@ interface EndorsementState {
   errorCategory:
     | "user_rejected" | "rpc_failure"
     | "contract_error" | "network_error" | null;
+}
+
+// ReputationScore (updated with endorsementCount)
+interface ReputationScore {
+  total: number;
+  breakdown: ReputationBreakdown;
+  contractCount: number;
+  verifiedContractCount: number;
+  endorsementCount: number;  // NEW
+  hasENS: boolean;
+  cappedAt: number | null;
+}
+
+interface ReputationBreakdown {
+  contractDeployments: number;
+  verifiedContracts: number;
+  endorsementPoints: number;  // NEW
+  ensOwnership: number;
+  ensMetadata: number;
+  timeMultiplierBonus: number;
 }
 
 // Attestation (expanded from 5 to 9 statuses + errorCategory)
@@ -413,7 +434,7 @@ function _update(address to, uint256 tokenId, address auth)
 # Install dependencies
 npm install
 
-# Run tests (112 tests across 3 files)
+# Run tests (117 tests across 3 files)
 npm test
 
 # Run tests in watch mode

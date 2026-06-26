@@ -16,6 +16,7 @@
 export const POINTS = {
   CONTRACT_DEPLOYMENT: 5,
   VERIFIED_CONTRACT:   10,
+  ENDORSEMENT_RECEIVED: 3, // per unique endorsement received (social signal)
   ENS_OWNERSHIP:       2,
   ENS_METADATA:        3, // per field: avatar, url, github
 };
@@ -23,6 +24,7 @@ export const POINTS = {
 export const CAPS = {
   MAX_DEPLOYMENTS_SCORED: 10,
   MAX_VERIFIED_SCORED:    10,
+  MAX_ENDORSEMENTS_SCORED: 10,
   BURST_WINDOW_SECONDS:   7 * 24 * 60 * 60, // 7 days
   BURST_THRESHOLD:        3,
 };
@@ -35,9 +37,10 @@ export const TIME_CONFIG = {
 
 /**
  * Theoretical maximum raw score — same as frontend.
- * 10 verified deployments × (5+10) × 1.2 + ENS full (2+3×3) = 191, rounded to 200.
+ * 10 verified deployments × (5+10) × 1.2 + 10 endorsements × 3 + ENS full (2+3×3)
+ *   = 60 + 120 + 30 + 2 + 9 = 221, rounded to 230.
  */
-export const THEORETICAL_MAX_SCORE = 200;
+export const THEORETICAL_MAX_SCORE = 230;
 
 /**
  * Tier thresholds use normalized scores (0–100).
@@ -222,21 +225,24 @@ export function getTier(normalizedScore) {
  *
  * @param {unknown} rawContracts — contract list (will be sanitized)
  * @param {unknown} rawENS       — ENS profile (will be sanitized)
+ * @param {number}  [endorsementCount=0] — number of endorsements received
  * @param {number}  [uniqueInteractors=0]
  * @returns {{
  *   total: number,
  *   breakdown: object,
  *   contractCount: number,
  *   verifiedContractCount: number,
+ *   endorsementCount: number,
  *   hasEns: boolean,
  *   cappedAt: number|null,
  *   tier: string,
  *   tierDescription: string
  * }}
  */
-export function computeReputationScore(rawContracts, rawENS, uniqueInteractors = 0) {
+export function computeReputationScore(rawContracts, rawENS, endorsementCount = 0, uniqueInteractors = 0) {
   const contracts = sanitizeContracts(rawContracts);
   const ens = sanitizeENS(rawENS);
+  const safeEndorsementCount = sanitizeNumber(endorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED);
 
   const capped    = contracts.slice(0, CAPS.MAX_DEPLOYMENTS_SCORED);
   const wasCapped = contracts.length > CAPS.MAX_DEPLOYMENTS_SCORED;
@@ -273,7 +279,10 @@ export function computeReputationScore(rawContracts, rawENS, uniqueInteractors =
     }
   }
 
-  const rawTotal = deployPts + verifiedPts + ensOwnership + ensMetadata;
+  // Endorsement scoring (capped to prevent farming)
+  const endorsementPts = Math.min(safeEndorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED) * POINTS.ENDORSEMENT_RECEIVED;
+
+  const rawTotal = deployPts + verifiedPts + endorsementPts + ensOwnership + ensMetadata;
   const total = normalizeScore(rawTotal);
   const { tier, tierDescription } = getTier(total);
 
@@ -282,6 +291,7 @@ export function computeReputationScore(rawContracts, rawENS, uniqueInteractors =
     breakdown: {
       contract_deployments:  deployPts,
       verified_contracts:    verifiedPts,
+      endorsement_points:    endorsementPts,
       ens_ownership:         ensOwnership,
       ens_metadata:          ensMetadata,
       time_multiplier_bonus: Math.round(timeBonus),
@@ -289,6 +299,7 @@ export function computeReputationScore(rawContracts, rawENS, uniqueInteractors =
     },
     contractCount:         contracts.length,
     verifiedContractCount: contracts.filter((c) => c.is_verified).length,
+    endorsementCount:      Math.min(safeEndorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED),
     hasEns:                Boolean(ens.name),
     cappedAt:              wasCapped ? CAPS.MAX_DEPLOYMENTS_SCORED : null,
     tier,

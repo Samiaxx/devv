@@ -35,10 +35,11 @@ export { POINTS as SCORING_RULES };
 
 /**
  * Theoretical maximum raw score.
- * Assumes: 10 verified deployments × (5+10) × 1.2 + ENS full (2+3×3) = 191.
- * Rounded to 200 for a clean normalization factor.
+ * Assumes: 10 verified deployments × (5+10) × 1.2 + 10 endorsements × 3 + ENS full (2+3×3)
+ *   = 60 + 120 + 30 + 2 + 9 = 221.
+ * Rounded to 230 for a clean normalization factor.
  */
-export const THEORETICAL_MAX_SCORE = 200;
+export const THEORETICAL_MAX_SCORE = 230;
 
 // ─── Input sanitization ──────────────────────────────────────────────────────
 
@@ -192,13 +193,16 @@ export function detectBurstContracts(contracts: NormalizedContract[]): Set<strin
  *
  * @param rawContracts — contract list (will be sanitized)
  * @param rawENS       — ENS profile (will be sanitized)
+ * @param rawEndorsementCount — number of endorsements received (will be sanitized)
  */
 export function computeReputationScore(
   rawContracts: unknown,
-  rawENS: unknown
+  rawENS: unknown,
+  rawEndorsementCount: unknown = 0
 ): ReputationScore {
   const contracts = sanitizeContracts(rawContracts);
   const ens = sanitizeENS(rawENS);
+  const endorsementCount = sanitizeNumber(rawEndorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED);
 
   // Apply cap to prevent spam boosting
   const cappedContracts = contracts.slice(0, CAPS.MAX_DEPLOYMENTS_SCORED);
@@ -243,9 +247,13 @@ export function computeReputationScore(
     if (ens.github) ensMetadataPoints += POINTS.ENS_METADATA;
   }
 
+  // Endorsement scoring (capped to prevent farming)
+  const endorsementPoints = Math.min(endorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED) * POINTS.ENDORSEMENT_RECEIVED;
+
   const rawTotal =
     contractDeploymentPoints +
     verifiedContractPoints +
+    endorsementPoints +
     ensOwnershipPoints +
     ensMetadataPoints;
 
@@ -254,12 +262,14 @@ export function computeReputationScore(
     breakdown: {
       contractDeployments: contractDeploymentPoints,
       verifiedContracts: verifiedContractPoints,
+      endorsementPoints,
       ensOwnership: ensOwnershipPoints,
       ensMetadata: ensMetadataPoints,
       timeMultiplierBonus: Math.round(timeMultiplierBonus),
     },
     contractCount: contracts.length,
     verifiedContractCount: contracts.filter((c) => c.isVerified).length,
+    endorsementCount: Math.min(endorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED),
     hasENS: !!ens.name,
     cappedAt: wasCapped ? CAPS.MAX_DEPLOYMENTS_SCORED : null,
   };

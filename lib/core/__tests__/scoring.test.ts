@@ -165,6 +165,7 @@ describe("normalizeScore", () => {
   });
 
   it("returns ~50 for half the theoretical max", () => {
+    // Half of 230 = 115 → normalizeScore(115) = Math.round(115/230*100) = 50
     expect(normalizeScore(THEORETICAL_MAX_SCORE / 2)).toBe(50);
   });
 
@@ -419,5 +420,60 @@ describe("computeReputationScore", () => {
     expect(result.total).toBeGreaterThanOrEqual(0);
     expect(result.total).toBeLessThanOrEqual(100);
     expect(Number.isFinite(result.total)).toBe(true);
+  });
+
+  // ── Endorsement scoring ───────────────────────────────────────────────────
+
+  it("scores higher with endorsements than without", () => {
+    const contracts = [
+      { contractAddress: "0x1", transactionHash: "0x1", blockNumber: 1, timestamp: 0, isVerified: false },
+    ];
+
+    const scoreWith = computeReputationScore(contracts, emptyENS, 5);
+    const scoreWithout = computeReputationScore(contracts, emptyENS, 0);
+
+    expect(scoreWith.total).toBeGreaterThan(scoreWithout.total);
+    expect(scoreWith.breakdown.endorsementPoints).toBe(15); // 5 × 3
+    expect(scoreWithout.breakdown.endorsementPoints).toBe(0);
+  });
+
+  it("caps endorsement count at MAX_ENDORSEMENTS_SCORED", () => {
+    const contracts = [
+      { contractAddress: "0x1", transactionHash: "0x1", blockNumber: 1, timestamp: 0, isVerified: false },
+    ];
+
+    const result = computeReputationScore(contracts, emptyENS, 50);
+    expect(result.endorsementCount).toBe(10); // capped at 10
+    expect(result.breakdown.endorsementPoints).toBe(30); // 10 × 3
+  });
+
+  it("handles negative endorsement count safely", () => {
+    const contracts = [
+      { contractAddress: "0x1", transactionHash: "0x1", blockNumber: 1, timestamp: 0, isVerified: false },
+    ];
+
+    const result = computeReputationScore(contracts, emptyENS, -5);
+    expect(result.endorsementCount).toBe(0);
+    expect(result.breakdown.endorsementPoints).toBe(0);
+  });
+
+  it("handles NaN endorsement count safely", () => {
+    const contracts = [
+      { contractAddress: "0x1", transactionHash: "0x1", blockNumber: 1, timestamp: 0, isVerified: false },
+    ];
+
+    const result = computeReputationScore(contracts, emptyENS, NaN);
+    expect(result.endorsementCount).toBe(0);
+    expect(result.breakdown.endorsementPoints).toBe(0);
+  });
+
+  it("defaults endorsement count to 0 when not provided", () => {
+    const contracts = [
+      { contractAddress: "0x1", transactionHash: "0x1", blockNumber: 1, timestamp: 0, isVerified: false },
+    ];
+
+    const result = computeReputationScore(contracts, emptyENS);
+    expect(result.endorsementCount).toBe(0);
+    expect(result.breakdown.endorsementPoints).toBe(0);
   });
 });

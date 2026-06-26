@@ -52,6 +52,7 @@ export interface ENSProfile {
 export interface ReputationBreakdown {
   contractDeployments: number;
   verifiedContracts: number;
+  endorsementPoints: number;
   ensOwnership: number;
   ensMetadata: number;
   timeMultiplierBonus: number; // net bonus/penalty from time weighting
@@ -62,6 +63,7 @@ export interface ReputationScore {
   breakdown: ReputationBreakdown;
   contractCount: number;
   verifiedContractCount: number;
+  endorsementCount: number;
   hasENS: boolean;
   cappedAt: number | null; // non-null if deployment count was capped
 }
