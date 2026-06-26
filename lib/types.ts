@@ -112,17 +112,32 @@ export interface AnalysisResponse {
 
 /**
  * State for an EAS attestation request.
- * idle     → user hasn't requested yet
- * signing  → server is signing the delegated payload
- * pending  → user has submitted the tx, waiting for confirmation
- * success  → attestation confirmed on-chain
- * error    → something failed
+ * notConnected      — wallet is not connected; prompt user to connect
+ * idle              — wallet connected, ready to attest
+ * signing           — server is signing the delegated payload
+ * awaitingConfirmation — server signed, wallet popup open for user to confirm
+ * pending           — user has submitted the tx, waiting for confirmation
+ * submitted         — tx submitted to network, awaiting block
+ * confirmed         — attestation confirmed on-chain
+ * rejected          — user rejected the tx in their wallet
+ * error             — something failed
  */
 export interface AttestationState {
-  status: "idle" | "signing" | "pending" | "success" | "error";
+  status:
+    | "notConnected"
+    | "idle"
+    | "signing"
+    | "awaitingConfirmation"
+    | "pending"
+    | "submitted"
+    | "confirmed"
+    | "rejected"
+    | "error";
   uid: string | null;       // on-chain attestation UID once confirmed
   txHash: string | null;
   error: string | null;
+  /** Error category for programmatic handling */
+  errorCategory: "user_rejected" | "rpc_failure" | "server_error" | "network_error" | null;
 }
 
 // ─── UI state ─────────────────────────────────────────────────────────────────
