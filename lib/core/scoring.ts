@@ -17,6 +17,12 @@
  * Anti-spam:
  *   BURST_THRESHOLD+ deployments within BURST_WINDOW_SECONDS → 0.8× on all burst contracts
  *
+ * Normalization:
+ *   Raw scores are normalized to a 0–100 range using a theoretical maximum.
+ *   Theoretical max assumes all deployments are verified, established (>30 days),
+ *   non-burst, with full ENS metadata: 10×5×1.2 + 10×10×1.2 + 2 + 3×3 = 191.
+ *   We round up to 200 for a clean scale factor.
+ *
  * This profile reflects on-chain activity only.
  * It does NOT measure developer skill or code quality.
  */
@@ -27,6 +33,107 @@ import { POINTS, CAPS, TIME } from "./constants";
 // Re-export for backwards compatibility and UI use
 export { POINTS as SCORING_RULES };
 
+/**
+ * Theoretical maximum raw score.
+ * Assumes: 10 verified deployments × (5+10) × 1.2 + 10 endorsements × 3 + ENS full (2+3×3)
+ *   = 60 + 120 + 30 + 2 + 9 = 221.
+ * Rounded to 230 for a clean normalization factor.
+ */
+export const THEORETICAL_MAX_SCORE = 230;
+
+// ─── Input sanitization ──────────────────────────────────────────────────────
+
+/**
+ * Sanitizes a numeric input to ensure it is a finite, non-negative integer.
+ * Handles NaN, Infinity, negative values, and non-numeric types safely.
+ *
+ * @param value  — the raw input to sanitize
+ * @param max    — optional upper bound (values above are clamped)
+ * @returns a safe, finite, non-negative integer
+ */
+export function sanitizeNumber(value: unknown, max: number = Number.MAX_SAFE_INTEGER): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  const rounded = Math.floor(value);
+  if (rounded < 0) return 0;
+  if (rounded > max) return max;
+  return rounded;
+}
+
+/**
+ * Sanitizes a contract timestamp.
+ * Returns 0 for invalid/missing timestamps (neutral weight in getTimeMultiplier).
+ */
+function sanitizeTimestamp(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return 0;
+  }
+  return Math.floor(value);
+}
+
+/**
+ * Validates and sanitizes a contract array before scoring.
+ * Filters out entries that are not objects or have no contractAddress.
+ * Sanitizes numeric fields to prevent NaN/Infinity propagation.
+ */
+export function sanitizeContracts(contracts: unknown): NormalizedContract[] {
+  if (!Array.isArray(contracts)) return [];
+
+  return contracts
+    .filter(
+      (c): c is NormalizedContract =>
+        c !== null &&
+        typeof c === "object" &&
+        typeof (c as NormalizedContract).contractAddress === "string" &&
+        (c as NormalizedContract).contractAddress.length > 0
+    )
+    .map((c) => ({
+      contractAddress: c.contractAddress,
+      transactionHash: c.transactionHash ?? "",
+      blockNumber: sanitizeNumber(c.blockNumber),
+      timestamp: sanitizeTimestamp(c.timestamp),
+      isVerified: Boolean(c.isVerified),
+    }));
+}
+
+/**
+ * Validates and sanitizes an ENS profile before scoring.
+ * Ensures all fields are either null or non-empty strings.
+ */
+export function sanitizeENS(ens: unknown): ENSProfile {
+  if (!ens || typeof ens !== "object") {
+    return { name: null, avatar: null, url: null, github: null };
+  }
+  const e = ens as Record<string, unknown>;
+  return {
+    name: typeof e.name === "string" && e.name.length > 0 ? e.name : null,
+    avatar: typeof e.avatar === "string" && e.avatar.length > 0 ? e.avatar : null,
+    url: typeof e.url === "string" && e.url.length > 0 ? e.url : null,
+    github: typeof e.github === "string" && e.github.length > 0 ? e.github : null,
+  };
+}
+
+// ─── Normalization ────────────────────────────────────────────────────────────
+
+/**
+ * Normalizes a raw score to the 0–100 range.
+ *
+ * Why normalize instead of hard-capping?
+ * A hard cap (Math.min(100, raw)) would compress all high-activity profiles
+ * into the same value, losing relative differences. Linear normalization
+ * preserves the distribution: a profile with half the activity of the
+ * theoretical max gets ~50, not 100.
+ *
+ * @param rawScore — the computed score (can exceed 100)
+ * @returns integer in [0, 100]
+ */
+export function normalizeScore(rawScore: number): number {
+  if (!Number.isFinite(rawScore) || rawScore < 0) return 0;
+  const normalized = Math.round((rawScore / THEORETICAL_MAX_SCORE) * 100);
+  return Math.min(100, Math.max(0, normalized));
+}
+
 // ─── Time multiplier ─────────────────────────────────────────────────────────
 
 /**
@@ -34,9 +141,10 @@ export { POINTS as SCORING_RULES };
  * Older activity = more weight. Recent burst = less weight.
  */
 export function getTimeMultiplier(timestamp: number): number {
-  if (timestamp === 0) return 1; // unknown timestamp — neutral
+  const safe = sanitizeTimestamp(timestamp);
+  if (safe === 0) return 1; // unknown timestamp — neutral
 
-  const ageSeconds = Math.floor(Date.now() / 1000) - timestamp;
+  const ageSeconds = Math.floor(Date.now() / 1000) - safe;
 
   if (ageSeconds > TIME.ESTABLISHED_THRESHOLD_SECONDS) {
     return TIME.ESTABLISHED_MULTIPLIER;
@@ -79,13 +187,23 @@ export function detectBurstContracts(contracts: NormalizedContract[]): Set<strin
  * Computes the full reputation score from normalized on-chain data.
  * Returns a breakdown so the UI can explain every point.
  *
- * @param contracts - Normalized, privacy-filtered contract list
- * @param ens       - Normalized ENS profile (empty if user opted out)
+ * Input safety: accepts raw (unvalidated) arrays and sanitizes them internally.
+ * The same inputs will always produce the same output (deterministic).
+ * The returned total is normalized to [0, 100].
+ *
+ * @param rawContracts — contract list (will be sanitized)
+ * @param rawENS       — ENS profile (will be sanitized)
+ * @param rawEndorsementCount — number of endorsements received (will be sanitized)
  */
 export function computeReputationScore(
-  contracts: NormalizedContract[],
-  ens: ENSProfile
+  rawContracts: unknown,
+  rawENS: unknown,
+  rawEndorsementCount: unknown = 0
 ): ReputationScore {
+  const contracts = sanitizeContracts(rawContracts);
+  const ens = sanitizeENS(rawENS);
+  const endorsementCount = sanitizeNumber(rawEndorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED);
+
   // Apply cap to prevent spam boosting
   const cappedContracts = contracts.slice(0, CAPS.MAX_DEPLOYMENTS_SCORED);
   const wasCapped = contracts.length > CAPS.MAX_DEPLOYMENTS_SCORED;
@@ -100,8 +218,9 @@ export function computeReputationScore(
 
   for (const contract of cappedContracts) {
     const isBurst = burstAddresses.has(contract.contractAddress);
-    // Burst contracts get an additional 0.8× on top of the time multiplier
-    const multiplier = getTimeMultiplier(contract.timestamp) * (isBurst ? TIME.RECENT_BURST_MULTIPLIER : 1);
+    // Burst contracts get an additional 0.8x on top of the time multiplier
+    const multiplier =
+      getTimeMultiplier(contract.timestamp) * (isBurst ? TIME.RECENT_BURST_MULTIPLIER : 1);
 
     const baseDeployPoints = POINTS.CONTRACT_DEPLOYMENT;
     const deployPoints = Math.round(baseDeployPoints * multiplier);
@@ -128,23 +247,29 @@ export function computeReputationScore(
     if (ens.github) ensMetadataPoints += POINTS.ENS_METADATA;
   }
 
-  const total =
+  // Endorsement scoring (capped to prevent farming)
+  const endorsementPoints = Math.min(endorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED) * POINTS.ENDORSEMENT_RECEIVED;
+
+  const rawTotal =
     contractDeploymentPoints +
     verifiedContractPoints +
+    endorsementPoints +
     ensOwnershipPoints +
     ensMetadataPoints;
 
   return {
-    total,
+    total: normalizeScore(rawTotal),
     breakdown: {
       contractDeployments: contractDeploymentPoints,
       verifiedContracts: verifiedContractPoints,
+      endorsementPoints,
       ensOwnership: ensOwnershipPoints,
       ensMetadata: ensMetadataPoints,
       timeMultiplierBonus: Math.round(timeMultiplierBonus),
     },
     contractCount: contracts.length,
     verifiedContractCount: contracts.filter((c) => c.isVerified).length,
+    endorsementCount: Math.min(endorsementCount, CAPS.MAX_ENDORSEMENTS_SCORED),
     hasENS: !!ens.name,
     cappedAt: wasCapped ? CAPS.MAX_DEPLOYMENTS_SCORED : null,
   };
@@ -153,43 +278,47 @@ export function computeReputationScore(
 // ─── Tier labels ─────────────────────────────────────────────────────────────
 
 /**
- * Returns a human-readable tier label based on total score.
+ * Returns a human-readable tier label based on normalized score (0–100).
  * Labels describe activity level, NOT skill level.
+ *
+ * @param score — a normalized score in [0, 100]
  */
 export function getScoreTier(score: number): {
   label: string;
   color: string;
   description: string;
 } {
-  if (score === 0) {
+  const safe = sanitizeNumber(score, 100);
+
+  if (safe === 0) {
     return {
       label: "No Activity",
       color: "text-gray-400",
       description: "No developer activity detected on-chain",
     };
   }
-  if (score < 10) {
+  if (safe < 15) {
     return {
       label: "Early Activity",
       color: "text-blue-400",
       description: "Early on-chain deployment activity",
     };
   }
-  if (score < 30) {
+  if (safe < 35) {
     return {
       label: "Active Builder",
       color: "text-green-400",
       description: "Regular smart contract deployment activity",
     };
   }
-  if (score < 60) {
+  if (safe < 55) {
     return {
       label: "Established",
       color: "text-yellow-400",
       description: "Consistent on-chain deployment history",
     };
   }
-  if (score < 100) {
+  if (safe < 80) {
     return {
       label: "Prolific",
       color: "text-orange-400",

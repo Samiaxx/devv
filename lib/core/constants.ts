@@ -9,6 +9,7 @@
 export const POINTS = {
   CONTRACT_DEPLOYMENT: 5,
   VERIFIED_CONTRACT: 10,
+  ENDORSEMENT_RECEIVED: 3, // per unique endorsement received (social signal)
   ENS_OWNERSHIP: 2,
   ENS_METADATA: 3, // per field: avatar, url, github
 } as const;
@@ -20,6 +21,8 @@ export const CAPS = {
   MAX_DEPLOYMENTS_SCORED: 10,
   /** Maximum verified contracts that contribute to score */
   MAX_VERIFIED_SCORED: 10,
+  /** Maximum endorsements that contribute to score (prevents endorsement farming) */
+  MAX_ENDORSEMENTS_SCORED: 10,
   /** Deployments within this window trigger burst detection (seconds) */
   BURST_WINDOW_SECONDS: 7 * 24 * 60 * 60, // 7 days
   /** If this many or more deployments fall in the burst window, flag it */

@@ -52,6 +52,7 @@ export interface ENSProfile {
 export interface ReputationBreakdown {
   contractDeployments: number;
   verifiedContracts: number;
+  endorsementPoints: number;
   ensOwnership: number;
   ensMetadata: number;
   timeMultiplierBonus: number; // net bonus/penalty from time weighting
@@ -62,6 +63,7 @@ export interface ReputationScore {
   breakdown: ReputationBreakdown;
   contractCount: number;
   verifiedContractCount: number;
+  endorsementCount: number;
   hasENS: boolean;
   cappedAt: number | null; // non-null if deployment count was capped
 }
@@ -112,17 +114,32 @@ export interface AnalysisResponse {
 
 /**
  * State for an EAS attestation request.
- * idle     → user hasn't requested yet
- * signing  → server is signing the delegated payload
- * pending  → user has submitted the tx, waiting for confirmation
- * success  → attestation confirmed on-chain
- * error    → something failed
+ * notConnected      — wallet is not connected; prompt user to connect
+ * idle              — wallet connected, ready to attest
+ * signing           — server is signing the delegated payload
+ * awaitingConfirmation — server signed, wallet popup open for user to confirm
+ * pending           — user has submitted the tx, waiting for confirmation
+ * submitted         — tx submitted to network, awaiting block
+ * confirmed         — attestation confirmed on-chain
+ * rejected          — user rejected the tx in their wallet
+ * error             — something failed
  */
 export interface AttestationState {
-  status: "idle" | "signing" | "pending" | "success" | "error";
+  status:
+    | "notConnected"
+    | "idle"
+    | "signing"
+    | "awaitingConfirmation"
+    | "pending"
+    | "submitted"
+    | "confirmed"
+    | "rejected"
+    | "error";
   uid: string | null;       // on-chain attestation UID once confirmed
   txHash: string | null;
   error: string | null;
+  /** Error category for programmatic handling */
+  errorCategory: "user_rejected" | "rpc_failure" | "server_error" | "network_error" | null;
 }
 
 // ─── UI state ─────────────────────────────────────────────────────────────────
@@ -138,4 +155,36 @@ export interface MintState {
   txHash: string | null;
   tokenId: string | null;
   error: string | null;
+}
+
+// ─── Endorsement transaction states ────────────────────────────────────────────
+
+/**
+ * Distinct states for an endorsement transaction flow.
+ * Each state maps to a specific UI representation.
+ *
+ * notConnected  — wallet is not connected; prompt user to connect
+ * idle          — wallet connected, ready to endorse
+ * awaitingConfirmation — tx sent to wallet, waiting for user to sign
+ * submitted     — tx submitted to network, waiting for confirmation
+ * confirmed     — tx confirmed on-chain
+ * rejected      — user rejected the tx in their wallet
+ * error         — contract call or RPC failure
+ */
+export type EndorsementStatus =
+  | "notConnected"
+  | "idle"
+  | "awaitingConfirmation"
+  | "submitted"
+  | "confirmed"
+  | "rejected"
+  | "error";
+
+export interface EndorsementState {
+  status: EndorsementStatus;
+  txHash: string | null;
+  blockNumber: number | null;
+  error: string | null;
+  /** Error category for programmatic handling */
+  errorCategory: "user_rejected" | "rpc_failure" | "contract_error" | "network_error" | null;
 }

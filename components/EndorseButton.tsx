@@ -1,40 +1,49 @@
 "use client";
 
 /**
- * AttestButton — a user-facing flow for submitting an EAS delegated attestation.
+ * EndorseButton — a user-facing flow for submitting an on-chain endorsement.
  *
  * Implements all 6 required transaction states:
- *   1. Not connected          → prompt to connect wallet
- *   2. Awaiting confirmation  → wallet popup open, user reviewing
- *   3. Transaction submitted  → tx sent to mempool, awaiting block
- *   4. Transaction confirmed  → tx mined, attestation UID received
- *   5. User rejection         → user denied in wallet
- *   6. Contract/RPC failure   → server signing error, network error, or other
+ *   1. Not connected      → prompt to connect wallet
+ *   2. Awaiting confirmation → wallet popup open, user reviewing
+ *   3. Transaction submitted → tx sent to mempool, awaiting block
+ *   4. Transaction confirmed → tx mined, success UI
+ *   5. User rejection       → user denied in wallet
+ *   6. Contract/RPC failure  → revert, network error, or other failure
  *
- * Flow:
- *   1. Browser asks server to sign a delegated attestation (POST /api/attest)
- *   2. Server signs with ATTESTER_PRIVATE_KEY (no ETH needed server-side)
- *   3. Browser submits the signed payload to EAS contract on Sepolia (user pays gas)
- *   4. Attestation is permanently on-chain, verifiable by anyone
+ * Calls the `endorse(address, score)` function on the ProofOfDev contract,
+ * which records that the connected wallet vouches for the endorsed address.
  *
- * Demo mode: when NEXT_PUBLIC_DEMO_MODE=true or ATTESTER_PRIVATE_KEY is not set,
+ * Uses wagmi v2 hooks for state management.
+ * Error classification distinguishes user rejection from technical failures.
+ *
+ * Demo mode: when NEXT_PUBLIC_DEMO_MODE=true or contract is not deployed,
  * the button simulates all 6 states without hitting the blockchain.
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { useAccount, useWalletClient, useChainId, useSwitchChain, useConnect } from "wagmi";
+import {
+  useAccount,
+  useWriteContract,
+  useWaitForTransactionReceipt,
+  useChainId,
+  useSwitchChain,
+  useConnect,
+  useReadContract,
+} from "wagmi";
 import { sepolia } from "wagmi/chains";
-import { BrowserProvider } from "ethers";
-import { EAS } from "@ethereum-attestation-service/eas-sdk";
-import { ReputationProfile, AttestationState } from "@/lib/types";
-import { EAS_CONFIG, easScanUrl } from "@/lib/eas/config";
+import { ReputationProfile, EndorsementState, EndorsementStatus } from "@/lib/types";
+import { CONTRACT_ADDRESS, CONTRACT_ABI } from "@/lib/contract";
 import { Spinner } from "@/components/ui/Spinner";
 
 // ─── Demo mode detection ──────────────────────────────────────────────────────
 
-const IS_DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
+const IS_DEMO_MODE =
+  process.env.NEXT_PUBLIC_DEMO_MODE === "true" ||
+  CONTRACT_ADDRESS === "0x0000000000000000000000000000000000000000";
 
-// Demo scenario selector
+// Demo scenario selector — set via NEXT_PUBLIC_DEMO_SCENARIO
+// Options: "success", "reject", "error", "cycle" (cycles through all)
 type DemoScenario = "success" | "reject" | "error" | "cycle";
 
 function getDemoScenario(): DemoScenario {
@@ -43,15 +52,24 @@ function getDemoScenario(): DemoScenario {
   return "success";
 }
 
-// Simulated demo data
-const DEMO_TX_HASH = "0x" + "b".repeat(64);
-const DEMO_UID = "0x" + "c".repeat(64);
+// Simulated demo transaction hashes
+const DEMO_TX_HASH = "0x" + "a".repeat(64);
+const DEMO_BLOCK_NUMBER = 12345678;
 
 // ─── Error classification ─────────────────────────────────────────────────────
 
+/**
+ * Classifies an error from a wagmi/ethers transaction into a user-facing category.
+ *
+ * User rejection (EIP-1193 code 4001 or common provider messages) is distinct
+ * from RPC/contract failures so the UI can offer the right recovery action:
+ *   - User rejection → "Try again" (no penalty, just re-prompt)
+ *   - RPC failure    → "Check network / retry" (may need network switch)
+ *   - Contract error → "Contract issue" (likely configuration problem)
+ */
 function classifyError(err: unknown): {
   message: string;
-  category: "user_rejected" | "rpc_failure" | "server_error" | "network_error";
+  category: EndorsementState["errorCategory"];
 } {
   const raw = err instanceof Error ? err.message : String(err);
   const lower = raw.toLowerCase();
@@ -70,24 +88,25 @@ function classifyError(err: unknown): {
     };
   }
 
-  // Server-side signing errors
-  if (
-    lower.includes("server signing failed") ||
-    lower.includes("attester_private_key") ||
-    lower.includes("schema uid not configured") ||
-    lower.includes("500")
-  ) {
-    return {
-      message: "Server could not sign the attestation. Contact the project maintainer.",
-      category: "server_error",
-    };
-  }
-
   // Insufficient funds
   if (lower.includes("insufficient funds") || lower.includes("insufficient balance")) {
     return {
       message: "Insufficient funds to cover gas fees.",
       category: "rpc_failure",
+    };
+  }
+
+  // Contract revert
+  if (
+    lower.includes("execution reverted") ||
+    lower.includes("revert") ||
+    lower.includes("require(") ||
+    lower.includes("already endorsed") ||
+    lower.includes("cannot self-endorse")
+  ) {
+    return {
+      message: "The contract rejected the transaction. This may be a configuration issue.",
+      category: "contract_error",
     };
   }
 
@@ -97,6 +116,7 @@ function classifyError(err: unknown): {
     lower.includes("timeout") ||
     lower.includes("fetch failed") ||
     lower.includes("econnrefused") ||
+    lower.includes("server error") ||
     lower.includes("502") ||
     lower.includes("503") ||
     lower.includes("504")
@@ -110,123 +130,228 @@ function classifyError(err: unknown): {
   // Fallback
   return {
     message: raw.split("\n")[0].slice(0, 200),
-    category: "server_error",
+    category: "contract_error",
   };
 }
 
-// ─── Extended state (wraps AttestationState with UI-specific fields) ──────────
-
-interface AttestUIState {
-  status:
-    | "notConnected"
-    | "idle"
-    | "awaitingConfirmation"
-    | "submitted"
-    | "confirmed"
-    | "rejected"
-    | "error";
-  uid: string | null;
-  txHash: string | null;
-  error: string | null;
-  errorCategory: "user_rejected" | "rpc_failure" | "server_error" | "network_error" | null;
-}
-
-const INITIAL_STATE: AttestUIState = {
-  status: "idle",
-  uid: null,
-  txHash: null,
-  error: null,
-  errorCategory: null,
-};
-
 // ─── Props ────────────────────────────────────────────────────────────────────
 
-interface AttestButtonProps {
+interface EndorseButtonProps {
+  /** The reputation profile being endorsed */
   profile: ReputationProfile;
+  /** The address being endorsed */
   address: string;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function AttestButton({ profile, address }: AttestButtonProps) {
-  const { isConnected } = useAccount();
+export function EndorseButton({ profile, address }: EndorseButtonProps) {
+  const { isConnected, address: connectedAddress } = useAccount();
   const chainId = useChainId();
   const { switchChain } = useSwitchChain();
   const { connect, connectors } = useConnect();
-  const { data: walletClient } = useWalletClient();
 
-  const [state, setState] = useState<AttestUIState>(INITIAL_STATE);
+  const [endorseState, setEndorseState] = useState<EndorsementState>({
+    status: "idle",
+    txHash: null,
+    blockNumber: null,
+    error: null,
+    errorCategory: null,
+  });
+
+  // Track which demo scenario to show next (for "cycle" mode)
   const demoCycleRef = useRef(0);
 
   const isOnSepolia = chainId === sepolia.id;
+  const isContractConfigured =
+    CONTRACT_ADDRESS !== "0x0000000000000000000000000000000000000000";
 
-  // ── Sync wallet connection ────────────────────────────────────────────────
+  // Check if current user has already endorsed this address
+  const { data: alreadyEndorsed } = useReadContract({
+    address: CONTRACT_ADDRESS as `0x${string}`,
+    abi: CONTRACT_ABI,
+    functionName: "hasEndorsed",
+    args: connectedAddress && address ? [connectedAddress, address as `0x${string}`] : undefined,
+    query: {
+      enabled: !IS_DEMO_MODE && isContractConfigured && !!connectedAddress && !!address && isOnSepolia,
+    },
+  });
 
+  // wagmi write hook
+  const {
+    writeContract,
+    data: txHash,
+    isPending: isWritePending,
+    error: writeError,
+    reset: resetWrite,
+  } = useWriteContract();
+
+  // wagmi wait-for-receipt hook
+  const {
+    data: receipt,
+    isLoading: isConfirming,
+    error: receiptError,
+  } = useWaitForTransactionReceipt({
+    hash: txHash,
+    query: { enabled: !!txHash },
+  });
+
+  // ── State transitions based on wagmi hooks (live mode only) ────────────────
+
+  // Sync wallet connection status
   useEffect(() => {
     if (!isConnected) {
-      setState({ ...INITIAL_STATE, status: "notConnected" });
-    } else if (state.status === "notConnected") {
-      setState((s) => ({ ...s, status: "idle" }));
+      setEndorseState({
+        status: "notConnected",
+        txHash: null,
+        blockNumber: null,
+        error: null,
+        errorCategory: null,
+      });
+    } else if (endorseState.status === "notConnected") {
+      setEndorseState((s) => ({ ...s, status: "idle" }));
     }
   }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Demo mode handler ─────────────────────────────────────────────────────
-
-  const runDemoScenario = useCallback((scenario: "success" | "reject" | "error") => {
-    // Step 1: awaitingConfirmation (simulate server signing)
-    setState({ ...INITIAL_STATE, status: "awaitingConfirmation" });
-
-    if (scenario === "reject") {
-      // After 1.5s, simulate user rejection
-      setTimeout(() => {
-        setState({
-          ...INITIAL_STATE,
-          status: "rejected",
-          error: "You rejected the transaction in your wallet.",
-          errorCategory: "user_rejected",
-        });
-      }, 1500);
-      return;
+  // awaitingConfirmation → writeContract is pending (wallet popup open)
+  useEffect(() => {
+    if (isWritePending && endorseState.status !== "awaitingConfirmation") {
+      setEndorseState((s) => ({
+        ...s,
+        status: "awaitingConfirmation",
+        error: null,
+        errorCategory: null,
+      }));
     }
+  }, [isWritePending]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Step 2: submitted (after 1.5s — server signed, user confirmed in wallet)
-    setTimeout(() => {
-      setState({
-        ...INITIAL_STATE,
+  // submitted → txHash received, waiting for block confirmation
+  useEffect(() => {
+    if (txHash && endorseState.status !== "submitted" && endorseState.status !== "confirmed") {
+      setEndorseState((s) => ({
+        ...s,
         status: "submitted",
-        txHash: DEMO_TX_HASH,
+        txHash,
+      }));
+    }
+  }, [txHash]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // confirmed → receipt received
+  useEffect(() => {
+    if (receipt && endorseState.status !== "confirmed") {
+      setEndorseState({
+        status: "confirmed",
+        txHash: receipt.transactionHash,
+        blockNumber: Number(receipt.blockNumber),
+        error: null,
+        errorCategory: null,
+      });
+    }
+  }, [receipt]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Error from writeContract hook
+  useEffect(() => {
+    if (writeError) {
+      const classified = classifyError(writeError);
+      setEndorseState({
+        status: classified.category === "user_rejected" ? "rejected" : "error",
+        txHash: null,
+        blockNumber: null,
+        error: classified.message,
+        errorCategory: classified.category,
+      });
+      resetWrite();
+    }
+  }, [writeError, resetWrite]);
+
+  // Error from receipt hook
+  useEffect(() => {
+    if (receiptError) {
+      const classified = classifyError(receiptError);
+      setEndorseState({
+        status: "error",
+        txHash: endorseState.txHash,
+        blockNumber: null,
+        error: classified.message,
+        errorCategory: classified.category,
+      });
+    }
+  }, [receiptError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Demo mode handlers ────────────────────────────────────────────────────
+
+  const runDemoScenario = useCallback(
+    (scenario: "success" | "reject" | "error") => {
+      // Step 1: awaitingConfirmation (after 500ms delay to simulate wallet popup)
+      setEndorseState({
+        status: "awaitingConfirmation",
+        txHash: null,
+        blockNumber: null,
+        error: null,
+        errorCategory: null,
       });
 
-      if (scenario === "error") {
-        // After 2 more seconds, simulate EAS contract error
+      if (scenario === "reject") {
+        // After 1.5s, simulate user rejection
         setTimeout(() => {
-          setState({
-            ...INITIAL_STATE,
-            status: "error",
-            txHash: DEMO_TX_HASH,
-            error: "Execution reverted: Schema not registered on this network.",
-            errorCategory: "server_error",
+          setEndorseState({
+            status: "rejected",
+            txHash: null,
+            blockNumber: null,
+            error: "You rejected the transaction in your wallet.",
+            errorCategory: "user_rejected",
           });
-        }, 2000);
+        }, 1500);
         return;
       }
 
-      // Step 3: confirmed (after 2 more seconds)
+      // Step 2: submitted (after 1.5s)
       setTimeout(() => {
-        setState({
-          ...INITIAL_STATE,
-          status: "confirmed",
-          uid: DEMO_UID,
+        setEndorseState({
+          status: "submitted",
           txHash: DEMO_TX_HASH,
+          blockNumber: null,
+          error: null,
+          errorCategory: null,
         });
-      }, 2000);
-    }, 1500);
-  }, []);
 
-  const handleDemoAttest = useCallback(() => {
+        if (scenario === "error") {
+          // After 2 more seconds, simulate contract error
+          setTimeout(() => {
+            setEndorseState({
+              status: "error",
+              txHash: DEMO_TX_HASH,
+              blockNumber: null,
+              error: "Execution reverted: Already endorsed this address.",
+              errorCategory: "contract_error",
+            });
+          }, 2000);
+          return;
+        }
+
+        // Step 3: confirmed (after 2 more seconds)
+        setTimeout(() => {
+          setEndorseState({
+            status: "confirmed",
+            txHash: DEMO_TX_HASH,
+            blockNumber: DEMO_BLOCK_NUMBER,
+            error: null,
+            errorCategory: null,
+          });
+        }, 2000);
+      }, 1500);
+    },
+    []
+  );
+
+  const handleDemoEndorse = useCallback(() => {
     const scenario = getDemoScenario();
     if (scenario === "cycle") {
-      const scenarios: Array<"success" | "reject" | "error"> = ["success", "reject", "error"];
+      const scenarios: Array<"success" | "reject" | "error"> = [
+        "success",
+        "reject",
+        "error",
+      ];
       runDemoScenario(scenarios[demoCycleRef.current % 3]);
       demoCycleRef.current++;
     } else {
@@ -234,92 +359,75 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
     }
   }, [runDemoScenario]);
 
-  // ── Live attestation handler ──────────────────────────────────────────────
+  // ── Handlers ──────────────────────────────────────────────────────────────
 
-  const handleAttest = useCallback(async () => {
+  const handleEndorse = useCallback(() => {
     if (IS_DEMO_MODE) {
-      handleDemoAttest();
+      handleDemoEndorse();
       return;
     }
 
-    if (!walletClient) return;
-
-    // Step 1: Ask server to sign
-    setState({ ...INITIAL_STATE, status: "awaitingConfirmation" });
-
-    try {
-      const res = await fetch("/api/attest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address, profile }),
+    if (!isContractConfigured) {
+      setEndorseState({
+        status: "error",
+        txHash: null,
+        blockNumber: null,
+        error: "Contract not deployed. See README for deployment instructions.",
+        errorCategory: "contract_error",
       });
-
-      const payload = await res.json();
-
-      if (!res.ok) {
-        throw new Error(payload.error ?? "Server signing failed");
-      }
-
-      // Step 2: Submit on-chain (user pays gas)
-      setState((s) => ({ ...s, status: "submitted", txHash: null }));
-
-      const provider = new BrowserProvider(walletClient.transport);
-      const signer = await provider.getSigner();
-
-      const eas = new EAS(payload.easContractAddress);
-      eas.connect(signer);
-
-      const tx = await eas.attestByDelegation({
-        schema: payload.schemaUID,
-        data: {
-          recipient: payload.recipient,
-          expirationTime: 0n,
-          revocable: true,
-          refUID: "0x0000000000000000000000000000000000000000000000000000000000000000",
-          data: payload.encodedData,
-          value: 0n,
-        },
-        signature: payload.signature,
-        attester: payload.attester,
-        deadline: 0n,
-      });
-
-      setState((s) => ({ ...s, txHash: tx.receipt?.hash ?? null }));
-
-      // Step 3: Wait for confirmation
-      const uid = await tx.wait();
-
-      setState({
-        ...INITIAL_STATE,
-        status: "confirmed",
-        uid: uid ?? null,
-        txHash: tx.receipt?.hash ?? null,
-      });
-    } catch (err) {
-      const classified = classifyError(err);
-      setState({
-        ...INITIAL_STATE,
-        status: classified.category === "user_rejected" ? "rejected" : "error",
-        error: classified.message,
-        errorCategory: classified.category,
-      });
+      return;
     }
-  }, [walletClient, address, profile, handleDemoAttest]);
 
-  // ── Retry handler ─────────────────────────────────────────────────────────
+    if (alreadyEndorsed) {
+      setEndorseState({
+        status: "error",
+        txHash: null,
+        blockNumber: null,
+        error: "You have already endorsed this address.",
+        errorCategory: "contract_error",
+      });
+      return;
+    }
+
+    setEndorseState({
+      status: "awaitingConfirmation",
+      txHash: null,
+      blockNumber: null,
+      error: null,
+      errorCategory: null,
+    });
+
+    writeContract({
+      address: CONTRACT_ADDRESS as `0x${string}`,
+      abi: CONTRACT_ABI,
+      functionName: "endorse",
+      args: [address as `0x${string}`, BigInt(profile.score)],
+    });
+  }, [isContractConfigured, alreadyEndorsed, address, profile.score, writeContract, handleDemoEndorse]);
 
   const handleRetry = useCallback(() => {
     // In demo cycle mode, auto-trigger next scenario
     if (IS_DEMO_MODE && getDemoScenario() === "cycle") {
-      const scenarios: Array<"success" | "reject" | "error"> = ["success", "reject", "error"];
+      const scenarios: Array<"success" | "reject" | "error"> = [
+        "success",
+        "reject",
+        "error",
+      ];
       const next = scenarios[demoCycleRef.current % 3];
       demoCycleRef.current++;
+      // Small delay so the user sees the reset before the next scenario starts
       setTimeout(() => runDemoScenario(next), 300);
       return;
     }
 
-    setState(INITIAL_STATE);
-  }, [runDemoScenario]);
+    setEndorseState((s) => ({
+      ...s,
+      status: "idle",
+      error: null,
+      errorCategory: null,
+    }));
+    resetWrite();
+  }, [resetWrite, runDemoScenario]);
 
   const handleConnect = useCallback(() => {
     const injected = connectors.find((c) => c.id === "injected");
@@ -330,11 +438,13 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
 
   // ── Render: Not Connected ──────────────────────────────────────────────────
 
-  if (state.status === "notConnected" || !isConnected) {
+  if (endorseState.status === "notConnected" || !isConnected) {
     return (
       <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 space-y-4 animate-fade-in-up">
         {IS_DEMO_MODE && (
-          <DemoBanner text="Connect any wallet to preview all states" />
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — Connect any wallet to preview all states
+          </div>
         )}
         <div className="flex items-start gap-3">
           <div className="w-10 h-10 rounded-xl bg-slate-800 flex items-center justify-center flex-shrink-0">
@@ -343,7 +453,7 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
           <div>
             <p className="text-sm font-semibold text-white">Connect Your Wallet</p>
             <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">
-              Connect your wallet to create an on-chain attestation of your reputation profile.
+              Connect your wallet to endorse this developer profile on-chain.
             </p>
           </div>
         </div>
@@ -351,7 +461,7 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
         <div className="bg-slate-800/40 rounded-xl p-3 text-xs text-slate-500 space-y-1.5">
           <div className="flex items-center gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-slate-600" />
-            <span>Attestation is recorded on Sepolia via EAS</span>
+            <span>Endorsement is recorded on Sepolia testnet</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-slate-600" />
@@ -359,7 +469,7 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
           </div>
           <div className="flex items-center gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-slate-600" />
-            <span>You can revoke the attestation at any time</span>
+            <span>The endorsement is permanent and public</span>
           </div>
         </div>
 
@@ -374,42 +484,57 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
     );
   }
 
-  // ── Render: Confirmed ──────────────────────────────────────────────────────
+  // ── Render: Already Endorsed (live mode only) ─────────────────────────────
 
-  if (state.status === "confirmed") {
+  if (!IS_DEMO_MODE && alreadyEndorsed && endorseState.status === "idle") {
     return (
       <div className="rounded-2xl border border-green-500/20 bg-green-500/8 p-5 space-y-3 animate-fade-in-up">
-        {IS_DEMO_MODE && <DemoBanner text="State 4/6: Confirmed" />}
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl bg-green-500/15 flex items-center justify-center text-xl flex-shrink-0">
             ✅
           </div>
           <div>
-            <p className="text-sm font-semibold text-green-400">Attestation Confirmed</p>
+            <p className="text-sm font-semibold text-green-400">Already Endorsed</p>
             <p className="text-xs text-slate-400 mt-0.5">
-              Your reputation profile is now a verifiable on-chain credential.
+              You have already endorsed this developer&apos;s profile on-chain.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Render: Confirmed ──────────────────────────────────────────────────────
+
+  if (endorseState.status === "confirmed") {
+    return (
+      <div className="rounded-2xl border border-green-500/20 bg-green-500/8 p-5 space-y-3 animate-fade-in-up">
+        {IS_DEMO_MODE && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — State 4/6: Confirmed
+          </div>
+        )}
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-green-500/15 flex items-center justify-center text-xl flex-shrink-0">
+            ✅
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-green-400">Endorsement Confirmed</p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Your endorsement has been recorded on the {IS_DEMO_MODE ? "simulated " : ""}Sepolia blockchain.
             </p>
           </div>
         </div>
 
         <div className="bg-slate-800/60 rounded-xl p-3 space-y-2 text-xs font-mono">
-          {state.uid && (
-            <div className="flex items-start gap-2">
-              <span className="text-slate-600 flex-shrink-0">UID</span>
-              <span className="text-slate-300 break-all">
-                {state.uid.slice(0, 20)}...
-                {IS_DEMO_MODE && <span className="ml-1 text-amber-400 text-[10px]">(simulated)</span>}
-              </span>
-            </div>
-          )}
-          {state.txHash && (
+          {endorseState.txHash && (
             <div className="flex items-start gap-2">
               <span className="text-slate-600 flex-shrink-0">Tx</span>
               <span className="text-indigo-400 break-all">
-                {state.txHash.slice(0, 20)}...
+                {endorseState.txHash.slice(0, 20)}...
                 {!IS_DEMO_MODE && (
                   <a
-                    href={`https://sepolia.etherscan.io/tx/${state.txHash}`}
+                    href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="ml-1 hover:underline"
@@ -417,6 +542,15 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
                     ↗
                   </a>
                 )}
+                {IS_DEMO_MODE && <span className="ml-1 text-amber-400">(simulated)</span>}
+              </span>
+            </div>
+          )}
+          {endorseState.blockNumber && (
+            <div className="flex items-start gap-2">
+              <span className="text-slate-600 flex-shrink-0">Block</span>
+              <span className="text-slate-300">
+                {endorseState.blockNumber}
                 {IS_DEMO_MODE && <span className="ml-1 text-amber-400 text-[10px]">(simulated)</span>}
               </span>
             </div>
@@ -431,15 +565,14 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
           </div>
         </div>
 
-        {!IS_DEMO_MODE && state.uid && (
+        {!IS_DEMO_MODE && (
           <a
-            href={easScanUrl(state.uid)}
+            href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center justify-center gap-2 w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors border border-slate-700"
           >
-            <EASIcon />
-            View on EAS Explorer ↗
+            View on Etherscan ↗
           </a>
         )}
 
@@ -453,7 +586,7 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
         )}
 
         <p className="text-xs text-slate-600 text-center">
-          {IS_DEMO_MODE ? "Demo" : "Attested by Proof of Dev"} · Sepolia testnet · Revocable
+          {IS_DEMO_MODE ? "Demo" : "Endorsed on Proof of Dev"} · Sepolia testnet
         </p>
       </div>
     );
@@ -461,10 +594,14 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
 
   // ── Render: Rejected ───────────────────────────────────────────────────────
 
-  if (state.status === "rejected") {
+  if (endorseState.status === "rejected") {
     return (
       <div className="rounded-2xl border border-yellow-500/20 bg-yellow-500/8 p-5 space-y-4 animate-fade-in-up">
-        {IS_DEMO_MODE && <DemoBanner text="State 5/6: User Rejection" />}
+        {IS_DEMO_MODE && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — State 5/6: User Rejection
+          </div>
+        )}
         <div className="flex items-start gap-3">
           <div className="w-10 h-10 rounded-xl bg-yellow-500/15 flex items-center justify-center text-xl flex-shrink-0">
             🚫
@@ -472,7 +609,7 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
           <div>
             <p className="text-sm font-semibold text-yellow-400">Transaction Rejected</p>
             <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
-              {state.error}
+              {endorseState.error}
             </p>
           </div>
         </div>
@@ -493,43 +630,41 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
 
   // ── Render: Error ──────────────────────────────────────────────────────────
 
-  if (state.status === "error") {
+  if (endorseState.status === "error") {
     return (
       <div className="rounded-2xl border border-red-500/20 bg-red-500/8 p-5 space-y-4 animate-fade-in-up">
-        {IS_DEMO_MODE && <DemoBanner text="State 6/6: Error" />}
+        {IS_DEMO_MODE && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+            🎭 Demo Mode — State 6/6: Error
+          </div>
+        )}
         <div className="flex items-start gap-3">
           <div className="w-10 h-10 rounded-xl bg-red-500/15 flex items-center justify-center text-xl flex-shrink-0">
             ⚠️
           </div>
           <div>
             <p className="text-sm font-semibold text-red-400">
-              {state.errorCategory === "rpc_failure"
+              {endorseState.errorCategory === "rpc_failure"
                 ? "Network Error"
-                : state.errorCategory === "server_error"
-                  ? "Server Error"
-                  : "Attestation Failed"}
+                : endorseState.errorCategory === "contract_error"
+                  ? "Contract Error"
+                  : "Transaction Failed"}
             </p>
             <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
-              {state.error}
+              {endorseState.error}
             </p>
           </div>
         </div>
 
-        {state.errorCategory === "rpc_failure" && (
+        {endorseState.errorCategory === "rpc_failure" && (
           <p className="text-xs text-slate-500">
             Check that you are connected to the Sepolia network and have sufficient testnet ETH.
           </p>
         )}
 
-        {state.errorCategory === "server_error" && (
+        {endorseState.errorCategory === "contract_error" && (
           <p className="text-xs text-slate-500">
-            The server could not sign the attestation. The EAS schema may not be registered or the attester key may be missing.
-          </p>
-        )}
-
-        {state.errorCategory === "network_error" && (
-          <p className="text-xs text-slate-500">
-            Check your internet connection and try again.
+            The contract may not be deployed on this network. Contact the project maintainer.
           </p>
         )}
 
@@ -550,9 +685,9 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
           </button>
         </div>
 
-        {state.txHash && !IS_DEMO_MODE && (
+        {endorseState.txHash && !IS_DEMO_MODE && (
           <a
-            href={`https://sepolia.etherscan.io/tx/${state.txHash}`}
+            href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
             target="_blank"
             rel="noopener noreferrer"
             className="block text-center text-xs text-indigo-400 hover:underline"
@@ -566,33 +701,30 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
 
   // ── Render: Awaiting Confirmation / Submitted (in-progress states) ─────────
 
-  const isBusy = state.status === "awaitingConfirmation" || state.status === "submitted";
+  const isBusy =
+    endorseState.status === "awaitingConfirmation" || endorseState.status === "submitted";
 
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 space-y-4 animate-fade-in-up">
       {/* Demo mode banner */}
       {IS_DEMO_MODE && (
-        <DemoBanner
-          text={
-            state.status === "idle"
-              ? "— Click Get Attestation to simulate"
-              : state.status === "awaitingConfirmation"
-                ? "State 2/6: Awaiting Confirmation"
-                : "State 3/6: Submitted"
-          }
-        />
+        <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
+          🎭 Demo Mode
+          {endorseState.status === "idle" && " — Click Endorse to simulate"}
+          {endorseState.status === "awaitingConfirmation" && " — State 2/6: Awaiting Confirmation"}
+          {endorseState.status === "submitted" && " — State 3/6: Submitted"}
+        </div>
       )}
 
       {/* Header */}
       <div className="flex items-start gap-3">
         <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center flex-shrink-0">
-          <EASIcon className="text-indigo-400" />
+          <EndorseIcon className="text-indigo-400" />
         </div>
         <div>
-          <p className="text-sm font-semibold text-white">EAS Attestation</p>
+          <p className="text-sm font-semibold text-white">Endorse Developer</p>
           <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">
-            Publish your reputation profile as a verifiable on-chain credential via the
-            Ethereum Attestation Service. The server signs; you submit.
+            Record your endorsement of this developer&apos;s on-chain activity on the {IS_DEMO_MODE ? "simulated " : ""}Sepolia blockchain.
           </p>
         </div>
       </div>
@@ -607,39 +739,22 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
         <DataRow label="Network" value={IS_DEMO_MODE ? "Sepolia (demo)" : "Sepolia"} />
       </div>
 
-      {/* How it works */}
-      {state.status === "idle" && (
-        <details className="group">
-          <summary className="text-xs text-slate-600 hover:text-slate-400 cursor-pointer select-none flex items-center gap-1 transition-colors">
-            <span className="group-open:rotate-90 transition-transform inline-block">▶</span>
-            How does this work?
-          </summary>
-          <div className="mt-2 text-xs text-slate-500 space-y-1.5 pl-3 leading-relaxed border-l border-slate-800">
-            <p>1. You click the button — your browser asks our server to sign the attestation data.</p>
-            <p>2. The server signs with its attester key (no ETH needed on our side).</p>
-            <p>3. Your wallet submits the signed payload to the EAS contract on Sepolia. You pay gas.</p>
-            <p>4. The attestation is permanently on-chain, verifiable by anyone, and linked to your wallet.</p>
-            <p className="text-slate-600 pt-1">You can revoke it at any time from the EAS Explorer.</p>
-          </div>
-        </details>
-      )}
-
       {/* In-progress feedback */}
-      {state.status === "awaitingConfirmation" && (
+      {endorseState.status === "awaitingConfirmation" && (
         <div className="bg-indigo-500/8 border border-indigo-500/20 rounded-xl p-3 flex items-center gap-3">
           <Spinner />
           <div>
-            <p className="text-xs font-medium text-indigo-300">Server is signing attestation</p>
+            <p className="text-xs font-medium text-indigo-300">Awaiting wallet confirmation</p>
             <p className="text-xs text-slate-500 mt-0.5">
               {IS_DEMO_MODE
-                ? "Simulating server signature... (auto-advancing in 1.5s)"
+                ? "Simulating wallet popup... (auto-advancing in 1.5s)"
                 : "Please confirm the transaction in your wallet."}
             </p>
           </div>
         </div>
       )}
 
-      {state.status === "submitted" && (
+      {endorseState.status === "submitted" && (
         <div className="bg-blue-500/8 border border-blue-500/20 rounded-xl p-3 space-y-2">
           <div className="flex items-center gap-3">
             <Spinner />
@@ -647,18 +762,18 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
               <p className="text-xs font-medium text-blue-300">Transaction submitted</p>
               <p className="text-xs text-slate-500 mt-0.5">
                 {IS_DEMO_MODE
-                  ? "Simulating on-chain confirmation... (auto-advancing in 2s)"
+                  ? "Simulating block confirmation... (auto-advancing in 2s)"
                   : "Waiting for blockchain confirmation..."}
               </p>
             </div>
           </div>
-          {state.txHash && (
+          {endorseState.txHash && (
             <span className="block text-xs text-indigo-400 font-mono">
-              {state.txHash.slice(0, 24)}...
+              {endorseState.txHash.slice(0, 24)}...
               {IS_DEMO_MODE && <span className="ml-1 text-amber-400 text-[10px]">(simulated)</span>}
               {!IS_DEMO_MODE && (
                 <a
-                  href={`https://sepolia.etherscan.io/tx/${state.txHash}`}
+                  href={`https://sepolia.etherscan.io/tx/${endorseState.txHash}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="ml-1 hover:underline"
@@ -671,7 +786,7 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
         </div>
       )}
 
-      {/* Network switch or attest button */}
+      {/* Network switch or endorse button */}
       {!IS_DEMO_MODE && !isOnSepolia ? (
         <button
           onClick={() => switchChain({ chainId: sepolia.id })}
@@ -681,40 +796,34 @@ export function AttestButton({ profile, address }: AttestButtonProps) {
         </button>
       ) : (
         <button
-          onClick={handleAttest}
-          disabled={isBusy}
+          onClick={handleEndorse}
+          disabled={isBusy || (!IS_DEMO_MODE && !!alreadyEndorsed)}
           className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 disabled:cursor-not-allowed text-white font-semibold rounded-xl transition-colors text-sm flex items-center justify-center gap-2"
         >
           {isBusy ? (
             <>
               <Spinner />
-              {state.status === "awaitingConfirmation" ? "Signing…" : "Confirming…"}
+              {endorseState.status === "awaitingConfirmation"
+                ? "Confirming..."
+                : "Processing..."}
             </>
           ) : (
             <>
-              <EASIcon className="w-4 h-4" />
-              {IS_DEMO_MODE ? "Get Attestation (Demo)" : "Get Attestation"}
+              <EndorseIcon className="w-4 h-4" />
+              {IS_DEMO_MODE ? "Endorse (Demo)" : "Endorse"}
             </>
           )}
         </button>
       )}
 
       <p className="text-xs text-slate-700 text-center">
-        {IS_DEMO_MODE ? "Demo" : "Sepolia testnet"} · Revocable · No personal data stored
+        {IS_DEMO_MODE ? "Demo" : "Sepolia testnet"} · Permanent · Public
       </p>
     </div>
   );
 }
 
 // ─── Helper components ────────────────────────────────────────────────────────
-
-function DemoBanner({ text }: { text: string }) {
-  return (
-    <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 text-xs text-amber-400 text-center font-medium">
-      🎭 Demo Mode {text}
-    </div>
-  );
-}
 
 function DataRow({ label, value }: { label: string; value: string }) {
   return (
@@ -744,7 +853,7 @@ function WalletIcon({ className }: { className?: string }) {
   );
 }
 
-function EASIcon({ className }: { className?: string }) {
+function EndorseIcon({ className }: { className?: string }) {
   return (
     <svg
       className={`w-4 h-4 flex-shrink-0 ${className ?? ""}`}
