@@ -406,6 +406,20 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
   }, [isContractConfigured, alreadyEndorsed, address, profile.score, writeContract, handleDemoEndorse]);
 
   const handleRetry = useCallback(() => {
+    // In demo cycle mode, auto-trigger next scenario
+    if (IS_DEMO_MODE && getDemoScenario() === "cycle") {
+      const scenarios: Array<"success" | "reject" | "error"> = [
+        "success",
+        "reject",
+        "error",
+      ];
+      const next = scenarios[demoCycleRef.current % 3];
+      demoCycleRef.current++;
+      // Small delay so the user sees the reset before the next scenario starts
+      setTimeout(() => runDemoScenario(next), 300);
+      return;
+    }
+
     setEndorseState((s) => ({
       ...s,
       status: "idle",
@@ -413,7 +427,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
       errorCategory: null,
     }));
     resetWrite();
-  }, [resetWrite]);
+  }, [resetWrite, runDemoScenario]);
 
   const handleConnect = useCallback(() => {
     const injected = connectors.find((c) => c.id === "injected");
@@ -562,6 +576,15 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           </a>
         )}
 
+        {IS_DEMO_MODE && (
+          <button
+            onClick={handleRetry}
+            className="w-full py-2.5 px-4 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl transition-colors text-sm"
+          >
+            🎭 Try Next Scenario →
+          </button>
+        )}
+
         <p className="text-xs text-slate-600 text-center">
           {IS_DEMO_MODE ? "Demo" : "Endorsed on Proof of Dev"} · Sepolia testnet
         </p>
@@ -599,7 +622,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
           onClick={handleRetry}
           className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl transition-colors text-sm"
         >
-          Try Again
+          {IS_DEMO_MODE ? "🎭 Try Next Scenario →" : "Try Again"}
         </button>
       </div>
     );
@@ -658,7 +681,7 @@ export function EndorseButton({ profile, address }: EndorseButtonProps) {
             onClick={handleRetry}
             className="flex-1 py-2.5 px-4 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-xl transition-colors text-sm"
           >
-            Retry
+            {IS_DEMO_MODE ? "🎭 Try Next Scenario →" : "Retry"}
           </button>
         </div>
 
